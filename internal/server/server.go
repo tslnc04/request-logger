@@ -3,83 +3,76 @@
 package server
 
 import (
-	"encoding/json"
-	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
-	"net/url"
-	"os"
+	"strings"
 )
 
-// MarhalableRequest contains all of the information from the request that we want to log. As its name suggests, it can
-// be used with [json.Marshal]. It is designed for use in a server rather than a client.
-type MarhalableRequest struct {
-	Method           string      `json:"method"`
-	URL              *url.URL    `json:"url"`
-	Proto            string      `json:"proto"`
-	ProtoMajor       int         `json:"proto_major"`
-	ProtoMinor       int         `json:"proto_minor"`
-	Header           http.Header `json:"header"`
-	Body             []byte      `json:"body"`
-	ContentLength    int64       `json:"content_length"`
-	TransferEncoding []string    `json:"transfer_encoding"`
-	Host             string      `json:"host"`
-	Trailer          http.Header `json:"trailer,omitempty"`
-	RemoteAddr       string      `json:"remote_addr"`
-	RequestURI       string      `json:"request_uri"`
-	Pattern          string      `json:"pattern"`
+// Handler is an http.Handler that logs requests to the specified loggers.
+type Handler struct {
+	errorLogger *slog.Logger
+	logger      *slog.Logger
 }
 
-// NewMarshalableRequest uses an [http.Request] to create a new MarhalableRequest. It will not close the request body as
-// it assumes the caller will do that.
-func NewMarshalableRequest(req *http.Request) (*MarhalableRequest, error) {
-	// We do not need to close the body reader since the http server will do it for us.
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		return nil, err
+// NewHandler creates a new Handler that logs requests to the provided loggers. Neither logger should be nil.
+//
+// Requests themselves will be logged to the logger and any errors will be logged to the errorLogger. The errorLogger
+// will only be used with level slog.LevelError.
+func NewHandler(errorLogger *slog.Logger, logger *slog.Logger) *Handler {
+	return &Handler{
+		errorLogger: errorLogger,
+		logger:      logger,
 	}
-
-	return &MarhalableRequest{
-		Method:           req.Method,
-		URL:              req.URL,
-		Proto:            req.Proto,
-		ProtoMajor:       req.ProtoMajor,
-		ProtoMinor:       req.ProtoMinor,
-		Header:           req.Header,
-		Body:             body,
-		ContentLength:    req.ContentLength,
-		TransferEncoding: req.TransferEncoding,
-		Host:             req.Host,
-		Trailer:          req.Trailer,
-		RemoteAddr:       req.RemoteAddr,
-		RequestURI:       req.RequestURI,
-		Pattern:          req.URL.Path,
-	}, nil
 }
 
-// Handle is the handler for the loggerd web server. Unless the marshaling fails, it will print the marshaled request to
-// stdout and return a 204 No Content response. If the marshaling fails, it will return a 500 Internal Server Error
-// response and print the error to stderr.
-func Handle(resp http.ResponseWriter, req *http.Request) {
-	marshalableReq, err := NewMarshalableRequest(req)
+// ServeHTTP is the handler for the loggerd web server.
+func (h *Handler) ServeHTTP(resp http.ResponseWriter, req *http.Request) {
+	attr, err := requestToAttr(req)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create marshalable request: %v\n", err)
+		h.errorLogger.Error("Failed to create request attribute", "error", err)
 
 		resp.WriteHeader(http.StatusInternalServerError)
 
 		return
 	}
 
-	marshaled, err := json.Marshal(marshalableReq)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to marshal request: %v\n", err)
-
-		resp.WriteHeader(http.StatusInternalServerError)
-
-		return
-	}
-
-	fmt.Println(string(marshaled))
+	h.logger.Info("Loggerd request received", attr)
 
 	resp.WriteHeader(http.StatusNoContent)
+}
+
+// requestToAttr creates a slog.Attr from an http.Request. It will not close the request body as it assumes the caller
+// will do that. It will return an error if the request body cannot be read.
+func requestToAttr(req *http.Request) (slog.Attr, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return slog.Attr{}, err
+	}
+
+	return slog.Group("request",
+		slog.String("method", req.Method),
+		slog.String("url", req.URL.String()),
+		slog.String("proto", req.Proto),
+		slog.Int("proto_major", req.ProtoMajor),
+		slog.Int("proto_minor", req.ProtoMinor),
+		headerToAttr(req.Header),
+		slog.String("body", string(body)),
+		slog.Int64("content_length", req.ContentLength),
+		slog.String("host", req.Host),
+		slog.String("remote_addr", req.RemoteAddr),
+		slog.String("request_uri", req.RequestURI),
+		slog.String("pattern", req.URL.Path),
+	), nil
+}
+
+func headerToAttr(header http.Header) slog.Attr {
+	attrs := make([]any, 0, len(header))
+
+	for key, values := range header {
+		joinedValues := strings.Join(values, ", ")
+		attrs = append(attrs, slog.String(key, joinedValues))
+	}
+
+	return slog.Group("header", attrs...)
 }

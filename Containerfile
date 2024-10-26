@@ -4,6 +4,7 @@ FROM docker.io/golang AS builder
 COPY . /src
 WORKDIR /src
 
+RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o /bin/loggerd cmd/loggerd/main.go
 
 # Container for the loggerd web server.
